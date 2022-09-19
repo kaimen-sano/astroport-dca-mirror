@@ -43,6 +43,12 @@ pub fn add_bot_tip(
     }
 
     for asset in assets {
+        // update user tip in state
+        let balance = user_config
+            .tip_balance
+            .iter_mut()
+            .find(|a| a.info == asset.info);
+
         // validate user sent what they said they did
         match &asset.info {
             AssetInfo::NativeToken { denom } => {
@@ -65,7 +71,13 @@ pub fn add_bot_tip(
             AssetInfo::Token { contract_addr } => {
                 let allowance =
                     get_token_allowance(&deps.as_ref(), &env, &info.sender, contract_addr)?;
-                if allowance != asset.amount {
+
+                let invalid_allowance = match balance.as_ref() {
+                    Some(balance) => allowance != balance.amount.checked_add(asset.amount)?,
+                    None => allowance != asset.amount,
+                };
+
+                if invalid_allowance {
                     return Err(ContractError::InvalidTipDeposit {
                         received: Asset {
                             amount: allowance,
@@ -76,12 +88,6 @@ pub fn add_bot_tip(
                 }
             }
         }
-
-        // update user tip in state
-        let balance = user_config
-            .tip_balance
-            .iter_mut()
-            .find(|a| a.info == asset.info);
 
         // increment balance
         match balance {
@@ -449,6 +455,93 @@ mod tests {
         let msg = ExecuteMsg::AddBotTip {
             assets: vec![tip_asset.clone()],
         };
+
+        // should error with InvalidTipDeposit
+        let res = app
+            .execute_contract(mock_creator().sender, dca_addr, &msg, &[])
+            .unwrap_err();
+        assert_eq!(
+            res.downcast::<ContractError>().unwrap(),
+            ContractError::InvalidTipDeposit {
+                received: Asset {
+                    info: AssetInfo::Token {
+                        contract_addr: cw20_addr
+                    },
+                    amount: Uint128::new(20_000)
+                },
+                sent: tip_asset
+            }
+        );
+    }
+
+    #[test]
+    fn does_error_on_mismatch_allowance() {
+        // instantiate contracts
+        let mut app = mock_app();
+
+        let cw20_token_id = store_cw20_token_code(&mut app);
+        let dca_module_id = store_dca_module_code(&mut app);
+
+        let cw20_addr = app
+            .instantiate_contract(
+                cw20_token_id,
+                mock_creator().sender,
+                &cw20_base::msg::InstantiateMsg {
+                    decimals: 6,
+                    initial_balances: vec![],
+                    marketing: None,
+                    mint: None,
+                    name: "cw20 token".to_string(),
+                    symbol: "cwT".to_string(),
+                },
+                &[],
+                "mock cw20 token",
+                None,
+            )
+            .unwrap();
+
+        let dca_addr = app_mock_instantiate(
+            &mut app,
+            dca_module_id,
+            Addr::unchecked("factory"),
+            Addr::unchecked("router"),
+            vec![Asset {
+                amount: Uint128::new(15_000),
+                info: AssetInfo::Token {
+                    contract_addr: cw20_addr.clone(),
+                },
+            }],
+        );
+
+        // increase allowance by 20,000
+        app.execute_contract(
+            mock_creator().sender,
+            cw20_addr.clone(),
+            &cw20_base::msg::ExecuteMsg::IncreaseAllowance {
+                spender: dca_addr.clone().into_string(),
+                amount: Uint128::new(20_000),
+                expires: None,
+            },
+            &[],
+        )
+        .unwrap();
+
+        let tip_asset = Asset {
+            amount: Uint128::new(20_000),
+            info: AssetInfo::Token {
+                contract_addr: cw20_addr.clone(),
+            },
+        };
+
+        let msg = ExecuteMsg::AddBotTip {
+            assets: vec![tip_asset.clone()],
+        };
+
+        let first_res_err = app
+            .execute_contract(mock_creator().sender, dca_addr.clone(), &msg, &[])
+            .err();
+
+        assert!(first_res_err.is_none());
 
         // should error with InvalidTipDeposit
         let res = app
